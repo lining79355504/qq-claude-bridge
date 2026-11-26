@@ -101,6 +101,8 @@ async function serverHarness(t, options = {}) {
         socket.send(JSON.stringify({ echo: packet.echo, status: 'ok', retcode: 0, data: { user_id: options.loginIds?.[Math.min(connectionCount - 1, options.loginIds.length - 1)] ?? 789 } }));
       } else if (packet.action === 'fail') {
         socket.send(JSON.stringify({ echo: packet.echo, status: 'failed', retcode: 100, wording: 'secret' }));
+      } else if (packet.action.startsWith('upload_')) {
+        socket.send(JSON.stringify({ echo: packet.echo, status: options.rejectUpload ? 'failed' : 'ok', retcode: options.rejectUpload ? 1404 : 0, data: null }));
       } else if (packet.action !== 'timeout') {
         const respond = () => socket.send(JSON.stringify({ echo: packet.echo, status: 'ok', retcode: 0, data: packet.action.startsWith('send_') ? { message_id: 99 } : packet.params }));
         if (packet.action === 'slow') setTimeout(respond, 15); else respond();
@@ -213,4 +215,23 @@ test('OneBot 图片以 base64 image 段发送到私聊和群，取消后不发�
   controller.abort();
   await assert.rejects(h.client.sendImage('user:123', image, { signal: controller.signal }));
   assert.equal(h.requests.length, count);
+});
+
+
+test('OneBot 普通文件使用上传扩展，中文名和字节保留；data:null 仅表示服务已接受', async (t) => {
+  const h = await serverHarness(t);
+  const file = { name: '测试文件.pdf', data: Buffer.from('%PDF-test').toString('base64') };
+  for (const target of ['user:123', 'group:456']) {
+    assert.deepEqual(await h.client.sendFile(target, file), { status: 'accepted' });
+    const request = h.requests.at(-1);
+    assert.equal(request.action, target.startsWith('user') ? 'upload_private_file' : 'upload_group_file');
+    assert.equal(request.params.name, file.name);
+    assert.equal(request.params.file, `base64://${file.data}`);
+  }
+  const count = h.requests.length;
+  await assert.rejects(h.client.sendFile('user:123', file, { signal: AbortSignal.abort() }));
+  assert.equal(h.requests.length, count);
+  const rejected = await serverHarness(t, { rejectUpload: true });
+  await assert.rejects(rejected.client.sendFile('group:456', file), /retcode=1404/);
+  assert.equal(rejected.requests.filter((r) => r.action.startsWith('upload_')).length, 1);
 });

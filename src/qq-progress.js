@@ -23,6 +23,6 @@ export class QQProgress {
     await this.pending;
     // Execution results are already saved. Delivery failure must not mark the task failed.
     try { await this.send(text); }
-    catch (error) { this.logger.error(`工单 #${this.ticketId} 结果发送失败，可通过 /history 查询`, error.message); }
+    catch (error) { this.logger.error(`工单 #${this.ticketId} 结果发送失败，已保存；请在原聊天发送 /result ${this.ticketId} 分页取回全文（不会重新执行）`, error.message); }
   }
 }

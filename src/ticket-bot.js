@@ -5,15 +5,19 @@ import { homedir } from 'node:os';
 import { resolve } from 'node:path';
 import { readWorkspaceImage } from './images.js';
 import { IMAGE_TOOL_NAME } from './image-tool.js';
+import { FILE_TOOL_NAME, readWorkspaceFile, fileReceipt } from './files.js';
 import { STATUS } from './tickets.js';
+import { appendTrace, traceEntry, renderTrace } from './verbose.js';
+import { renderResult } from './ticket-result.js';
+import { redactSecrets } from './schedule-delivery.js';
 
 const approvalReply = /^(?:y|yes|n|no|同意|拒绝)(?:\s|$)/i;
 const label = (ticket) => `#${ticket.id} ${ticket.title}`;
 
 /** 消息路由和串行执行器，传输层与 Claude SDK 可替换，便于离线测试。 */
 export class TicketBot {
-  constructor({ store, config, send, createProgress, createSession, logger, scheduler, sendImage }) {
-    Object.assign(this, { store, config, send, createProgress, createSession, logger, scheduler, sendImage });
+  constructor({ store, config, send, createProgress, createSession, logger, scheduler, sendImage, sendFile }) {
+    Object.assign(this, { store, config, send, createProgress, createSession, logger, scheduler, sendImage, sendFile });
     this.approvals = new ApprovalManager({ logger, timeoutMs: config.approvalTimeoutMs });
     this.sessions = new Map();
     this.frames = new Map();
@@ -59,20 +63,29 @@ export class TicketBot {
 
   async command(chatKey, userId, text, frame, images = []) {
     if (images.length && !/^\/new(?:\s|$)/.test(text)) throw new Error('图片请随普通需求或 /new 需求发送，不支持给管理命令附图。');
-    if (/^\/image(?:\s|$)/.test(text)) {
-      let filePath = text.slice('/image'.length).trim();
-      if (!filePath) throw new Error('用法：/image 图片路径，例如 /image ~/Downloads/screenshot.png');
+    if (/^\/(?:image|file)(?:\s|$)/.test(text)) {
+      const isFile = /^\/file(?:\s|$)/.test(text);
+      const command = isFile ? '/file' : '/image';
+      let filePath = text.slice(command.length).trim();
+      if (!filePath) throw new Error(`用法：${command} 文件路径，例如 ${command} ~/Downloads/${isFile ? 'report.pdf' : 'screenshot.png'}`);
       if ((filePath.startsWith('"') && filePath.endsWith('"')) || (filePath.startsWith("'") && filePath.endsWith("'"))) {
         filePath = filePath.slice(1, -1);
       }
-      if (!this.sendImage) throw new Error('当前通道未启用图片发送');
-      if (this.config.deniedTools?.includes(IMAGE_TOOL_NAME)) throw new Error('图片发送已被配置禁用');
+      const sender = isFile ? this.sendFile : this.sendImage;
+      if (!sender) throw new Error('当前通道未启用此附件发送功能');
+      if (this.config.deniedTools?.includes(isFile ? FILE_TOOL_NAME : IMAGE_TOOL_NAME)) throw new Error('附件发送已被配置禁用');
       if (filePath.startsWith('~/')) filePath = resolve(homedir(), filePath.slice(2));
       const ticket = this.store.current(chatKey);
-      const image = await readWorkspaceImage(filePath, ticket?.workspace ?? this.config.workspace, this.config.allowedPaths);
+      const attachment = await (isFile ? readWorkspaceFile : readWorkspaceImage)(filePath,
+        ticket?.workspace ?? this.config.workspace, this.config.allowedPaths);
       if (this.shuttingDown) return;
-      await this.sendImage(frame, image, { signal: this.imageController.signal });
-      if (ticket) this.store.addMessage(ticket.id, 'system', '通过 /image 向当前聊天发送一张图片。');
+      const result = await sender(frame, attachment, { signal: this.imageController.signal });
+      const receipt = isFile ? fileReceipt(result) : '图片已发送到当前聊天。';
+      if (ticket) this.store.addMessage(ticket.id, 'system', `通过 ${command}：${receipt}`);
+      if (isFile && result.status === 'accepted') {
+        try { await this.send(frame, receipt); }
+        catch (error) { this.logger.warn('文件上传已接受，提示文字发送失败', error); }
+      }
       return;
     }
     if (/^\/schedule(?:\s|$)/.test(text)) {
@@ -81,6 +94,33 @@ export class TicketBot {
     }
     const [command, ...parts] = text.slice(1).split(/\s+/);
     const arg = parts.join(' ').trim();
+    if (command === 'result') {
+      const match = /^(?:(#?[1-9]\d*)(?:\s+([1-9]\d*)(?:\s+([1-9]\d*))?)?)?$/.exec(arg);
+      if (!match || match.slice(1).some((v) => v && !Number.isSafeInteger(Number(v.replace('#', ''))))) {
+        throw new Error('用法：/result [工单编号] [页码] [回复编号]');
+      }
+      const ticket = this.target(chatKey, match[1]);
+      const message = this.store.result(ticket.id, match[3] ? Number(match[3]) : undefined);
+      if (!message) return this.send(frame, match[3] ? '该回复不存在或不属于此工单。'
+        : `工单 #${ticket.id} 尚无已保存的 Claude 回复。可用 /status ${ticket.id} 查看执行状态。`);
+      return this.send(frame, renderResult(ticket.id, message, Number(match[2] ?? 1), this.config.messageMaxBytes));
+    }
+    if (command === 'verbose') {
+      if (!arg) return this.send(frame, `执行摘要：${this.store.verboseEnabled(chatKey) ? '已开启，默认折叠' : '已关闭'}。\n/verbose on 开启，/verbose off 关闭，/verbose show [工单编号] [页码] 展开。`);
+      if (arg === 'on' || arg === 'off') {
+        this.store.setVerbose(chatKey, arg === 'on');
+        return this.send(frame, arg === 'on'
+          ? '已开启执行摘要，默认折叠。发送 /verbose show 查看模型返回的思考摘要和工具调用记录。QQ 纯文本不支持点击展开；开关按聊天保存。'
+          : '已关闭执行摘要，停止记录后续摘要。已有记录仍可用 /verbose show 查看。');
+      }
+      const match = /^show(?:\s+(#?[1-9]\d*))?(?:\s+([1-9]\d*))?$/.exec(arg);
+      if (!match) throw new Error('用法：/verbose on、/verbose off、/verbose show [工单编号] [页码]');
+      const ticket = !match[1] && this.active?.ticket.chat_key === chatKey
+        ? this.store.require(chatKey, this.active.ticket.id) : this.target(chatKey, match[1]);
+      const trace = this.store.latestTrace(ticket.id);
+      return this.send(frame, trace ? renderTrace(ticket.id, trace, Number(match[2] ?? 1), this.config.messageMaxBytes)
+        : `工单 #${ticket.id} 最新一轮暂无摘要记录。请先 /verbose on；开启后仅记录后续事件，不补录之前的过程。`);
+    }
     if (command === 'new') {
       if (!arg) throw new Error('用法：/new 需求描述');
       const ticket = this.store.create(chatKey, userId, arg, this.config.workspace);
@@ -101,10 +141,13 @@ export class TicketBot {
         '`/switch 编号` 切换当前工单',
         '`/status [编号]` 查看状态和待审批操作',
         '`/history [编号]` 查看最近 10 条记录',
+        '`/result [编号] [页码]` 分页取回已保存回复全文，不重新执行任务',
         '`/stop [编号]` 中止执行并取消该工单排队消息（默认停止本聊天正在执行的工单）',
         '`/resume [编号]` 恢复重启前任务或继续处理',
         '`/close [编号]` 验收并关闭',
         '`/reset` 清空当前工单 Claude 上下文，保留记录',
+        '`/file 文件路径` 回传已有文件，最多 10 MiB；普通文件能力取决于接入平台',
+        '`/verbose on|off` 开关执行摘要（默认折叠）；`/verbose show [编号] [页码]` 展开',
         '`/image 图片路径` 直接发送已有图片，不调用 Claude（支持 ~ 和带空格的路径）',
         '支持直接发图片或文字附图；需要回传图片/截图时直接说明。',
         '`/schedule help` 定时执行 Claude 任务，推送到当前聊天或企微群 Webhook',
@@ -133,13 +176,14 @@ export class TicketBot {
         `权限模式：${this.config.permissionMode}`,
         `待处理消息：${this.store.pending(ticket.id).length}`,
         `上下文：${ticket.session_id ? '已保存' : '新会话'}`,
+        `已保存回复全文：/result ${ticket.id}`,
         ...(this.active?.ticket.chat_key === chatKey ? [`本聊天正在执行：#${this.active.ticket.id}`] : []),
         ...(pending ? [`工单 #${pending.ticketId} 待审批：\`y ${pending.id}\` / \`n ${pending.id}\``] : []),
       ].join('\n'));
     }
     if (command === 'history') {
       const rows = this.store.history(ticket.id);
-      return this.send(frame, `**${label(ticket)} · 最近记录**\n\n` + (rows.map((m) =>
+      return this.send(frame, `**${label(ticket)} · 最近记录**\n已保存回复全文：/result ${ticket.id}\n\n` + (rows.map((m) =>
         `${m.role === 'user' ? '用户' : m.role === 'assistant' ? 'Claude' : '系统'}：${m.content.slice(0, 500)}${m.image_count ? ` [附 ${m.image_count} 张图片]` : ''}`).join('\n\n') || '暂无记录。'));
     }
     if (command === 'stop') {
@@ -197,7 +241,8 @@ export class TicketBot {
     }
     const jobId = this.store.enqueue(ticket.id, text, images);
     this.frames.set(jobId, frame);
-    await this.acknowledge(frame, `📋 **${label(ticket)}**\n需求已保存，${this.draining ? '已排队，当前操作结束后处理' : '准备执行'}。`);
+    await this.acknowledge(frame, `📋 **${label(ticket)}**\n需求已保存，${this.draining ? '已排队，当前操作结束后处理' : '准备执行'}。`
+      + this.traceHint(ticket));
     this.kick();
   }
 
@@ -205,6 +250,11 @@ export class TicketBot {
   async acknowledge(frame, text) {
     try { await this.send(frame, text); }
     catch (error) { this.logger.warn('工单已保存，确认消息发送失败', error); }
+  }
+
+  traceHint(ticket) {
+    return this.store.verboseEnabled(ticket.chat_key)
+      ? `\n\n▶ 执行摘要已折叠 · /verbose show ${ticket.id} 查看` : '';
   }
 
   kick() {
@@ -238,10 +288,15 @@ export class TicketBot {
       this.active = active;
       session.currentFrame = frame;
       const progress = this.createProgress(frame, ticket);
+      const trace = { entries: [], dropped: 0 };
+      if (this.store.verboseEnabled(ticket.chat_key)) this.store.saveTrace(job.id, trace);
       session.onEvent = (event) => {
-        if (event.kind === 'tool_use') {
-          const detail = event.input?.command ?? event.input?.file_path ?? event.input?.path ?? '';
-          void progress.push(`${event.toolName}: ${String(detail).slice(0, 150)}`);
+        if (this.active !== active || active.cancelled || this.shuttingDown
+          || !this.store.verboseEnabled(ticket.chat_key)) return;
+        const entry = traceEntry(event);
+        if (entry) {
+          appendTrace(trace, entry);
+          this.store.saveTrace(job.id, trace);
         }
       };
       this.store.jobState(job.id, 'running');
@@ -250,7 +305,6 @@ export class TicketBot {
         if (!isInside(ticket.workspace, this.config.allowedPaths)) {
           throw new Error('工单工作目录不在当前允许目录内，请调整 CLAUDE_ALLOWED_PATHS 后重试。');
         }
-        await progress.push(`工单 #${ticket.id} 开始处理…`);
         if (active.cancelled || this.shuttingDown) throw new Error('任务已中止');
         const initial = this.store.initialRequest(ticket.id);
         const preface = session.sessionId ? '' : `当前工单：${label(ticket)}\n`
@@ -258,20 +312,27 @@ export class TicketBot {
         const recovery = job.recovered ? '上次执行被中断。先核查已完成的工作，避免重复执行操作。\n\n' : '';
         const answer = await session.run(preface + recovery + job.content, { images: JSON.parse(job.images || '[]') });
         if (active.cancelled || this.shuttingDown) throw new Error('任务已中止');
-        this.store.addMessage(ticket.id, 'assistant', answer || '（没有输出）');
+        const resultId = this.store.addMessage(ticket.id, 'assistant', answer || '（没有输出）');
         this.store.jobState(job.id, session.lastRunSucceeded === false ? 'failed' : 'done');
         this.store.setStatus(ticket.id, session.lastRunSucceeded === false ? 'failed' : 'review');
         if (session.lastRunSucceeded === false) this.pauseRemaining(ticket.id);
         else if (this.store.pending(ticket.id).length) this.store.setStatus(ticket.id, 'queued');
-        await progress.finish(`**工单 #${ticket.id} · ${STATUS[this.store.get(ticket.id).status]}**\n\n${answer || '（没有输出）'}`
-          + (session.lastRunSucceeded === false ? `\n\n可用 /resume ${ticket.id} 继续处理。` : ''));
+        const reply = `**工单 #${ticket.id} · ${STATUS[this.store.get(ticket.id).status]}**\n\n${answer || '（没有输出）'}`
+          + (session.lastRunSucceeded === false ? `\n\n可用 /resume ${ticket.id} 继续处理。` : '') + this.traceHint(ticket);
+        // Save everything first, but do not drain the official passive budget
+        // by pushing all pages of a long answer in a single burst.
+        const longOfficialReply = this.config.transport === 'official'
+          && Buffer.byteLength(redactSecrets(reply), 'utf8') > (this.config.messageMaxBytes ?? 3800);
+        await progress.finish(longOfficialReply
+          ? renderResult(ticket.id, { id: resultId, content: answer || '（没有输出）' }, 1, this.config.messageMaxBytes)
+          : reply);
       } catch (error) {
         this.store.jobState(job.id, this.shuttingDown ? 'paused' : active.cancelled ? 'cancelled' : 'failed');
         this.store.setStatus(ticket.id, this.shuttingDown || active.cancelled ? 'stopped' : 'failed');
         this.pauseRemaining(ticket.id);
         this.store.addMessage(ticket.id, 'system', error.message);
         await progress.finish(`**工单 #${ticket.id}**\n${active.cancelled ? '🛑 已停止。' : `❌ ${error.message}`}`
-          + `\n可用 /resume ${ticket.id} 继续处理。`);
+          + `\n可用 /resume ${ticket.id} 继续处理。` + this.traceHint(ticket));
       } finally {
         this.approvals.cancel(ticket.chat_key, '本轮执行已结束');
         session.currentFrame = null;
@@ -303,6 +364,14 @@ export class TicketBot {
           }
           await this.sendImage(session.currentFrame, image, options);
           this.store.addMessage(ticket.id, 'system', '已向当前聊天发送一张图片。');
+        } : undefined,
+        onFile: this.sendFile ? async (file, options) => {
+          if (!session.currentFrame || this.active?.ticket.id !== ticket.id || this.active.cancelled || this.shuttingDown) {
+            throw new Error('当前工单已停止，未发送文件');
+          }
+          const result = await this.sendFile(session.currentFrame, file, options);
+          this.store.addMessage(ticket.id, 'system', fileReceipt(result));
+          return result;
         } : undefined,
         canUseTool: (name, input, opts) => this.permission(ticket, session.currentFrame, name, input, opts),
         logger: this.logger,

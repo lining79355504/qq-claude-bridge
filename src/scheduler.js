@@ -64,9 +64,9 @@ export function parseAdd(text, config, now) {
 
 /** Independent Claude workers and a durable outbox; no dependency on the interactive ticket queue. */
 export class Scheduler {
-  constructor({ store, config, createSession, sendChat, sendImage, isChatReady = () => true,
+  constructor({ store, config, createSession, sendChat, sendImage, sendFile, isChatReady = () => true,
     webhookSender = sendWebhook, logger, now = () => Date.now() }) {
-    Object.assign(this, { store, config, createSession, sendChat, sendImage, isChatReady, webhookSender, logger, now });
+    Object.assign(this, { store, config, createSession, sendChat, sendImage, sendFile, isChatReady, webhookSender, logger, now });
     this.active = new Map();
     this.delivering = new Map();
     this.stopping = false;
@@ -138,6 +138,10 @@ export class Scheduler {
         onImage: this.sendImage && schedule.target_type === 'chat' ? async (image, options) => {
           if (active.cancelled || active.finished || this.stopping) throw new Error('定时运行已结束或停止，未发送图片');
           await this.sendImage(schedule.chat_target, image, options);
+        } : undefined,
+        onFile: this.sendFile && schedule.target_type === 'chat' ? async (file, options) => {
+          if (active.cancelled || active.finished || this.stopping) throw new Error('定时运行已结束或停止，未发送文件');
+          return this.sendFile(schedule.chat_target, file, options);
         } : undefined,
         canUseTool: (name, input, opts) => this.permission(active, name, input, opts),
         logger: this.logger,

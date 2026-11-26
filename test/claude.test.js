@@ -74,6 +74,25 @@ test('success 子类型仍携带 is_error 时不能作为成功输出', async ()
   assert.equal(session.lastRunFailure.code, 'error_max_turns');
 });
 
+test('只转发 SDK 可见的思考内容，忽略签名、隐藏块和流式副本，不混入最终答案', async () => {
+  const events = [];
+  const session = sessionWith(async function* () {
+    yield { type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'thinking_delta', thinking: '副本' } } };
+    yield { type: 'assistant', message: { content: [
+      { type: 'thinking', thinking: '先检查配置，再运行验证。', signature: 'secret-signature' },
+      { type: 'redacted_thinking', data: 'secret-redacted' },
+      { type: 'tool_use', name: 'Read', input: { file_path: '/workspace/config.js' } },
+      { type: 'text', text: '检查完成。' },
+    ] } };
+    yield { type: 'result', subtype: 'success', result: '最终答复' };
+  }, { onEvent: (event) => events.push(event) });
+  assert.equal(await session.run('检查配置'), '最终答复');
+  assert.equal(events.length, 2);
+  assert.deepEqual(events[0], { kind: 'thinking', text: '先检查配置，再运行验证。' });
+  assert.equal(events[1].kind, 'tool_use');
+  assert.doesNotMatch(JSON.stringify(events), /secret|副本/);
+});
+
 test('定时轮数配置默认 100，独立于普通工单，拒绝无效输入', () => {
   const previous = process.env.SCHEDULE_MAX_TURNS;
   const previousInteractive = process.env.CLAUDE_MAX_TURNS;

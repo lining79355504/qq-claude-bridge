@@ -33,14 +33,16 @@ const store = new TicketStore(config.ticketDbPath);
 const sendTo = (target, text) => client.sendMessage(target, redactSecrets(text));
 const send = (frame, text) => sendTo(frame.target, text);
 const sendImage = (target, image, options) => client.sendImage(target, image, options);
+const sendFile = (target, file, options) => client.sendFile(target, file, options);
 const downloads = new AbortController();
 const scheduler = new Scheduler({
   store: new ScheduleStore(store), config, logger: log,
   createSession: (options) => new ClaudeSession(options),
-  sendChat: sendTo, sendImage, isChatReady: () => client.ready,
+  sendChat: sendTo, sendImage, sendFile, isChatReady: () => client.ready,
 });
 const bot = new TicketBot({
   store, config, logger: log, send,
+  sendFile: (frame, file, options) => sendFile(frame.target, file, options),
   sendImage: (frame, image, options) => sendImage(frame.target, image, options),
   createProgress: (frame, ticket) => {
     const progress = new QQProgress({ send: (text) => send(frame, text), ticketId: ticket.id,

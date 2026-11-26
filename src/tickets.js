@@ -36,6 +36,13 @@ export class TicketStore {
         message_id INTEGER NOT NULL REFERENCES messages(id), state TEXT NOT NULL DEFAULT 'queued',
         recovered INTEGER NOT NULL DEFAULT 0
       );
+      CREATE TABLE IF NOT EXISTS chat_settings (
+        chat_key TEXT PRIMARY KEY, verbose INTEGER NOT NULL DEFAULT 0
+      );
+      CREATE TABLE IF NOT EXISTS job_traces (
+        job_id INTEGER PRIMARY KEY REFERENCES jobs(id),
+        entries TEXT NOT NULL DEFAULT '[]', dropped INTEGER NOT NULL DEFAULT 0
+      );
     `);
     if (!this.db.prepare('PRAGMA table_info(messages)').all().some((c) => c.name === 'images')) {
       this.db.exec("ALTER TABLE messages ADD COLUMN images TEXT NOT NULL DEFAULT '[]'");
@@ -115,6 +122,38 @@ export class TicketStore {
   initialRequest(id) {
     return this.db.prepare("SELECT content FROM messages WHERE ticket_id = ? AND role = 'user' ORDER BY id LIMIT 1")
       .get(id)?.content;
+  }
+
+  result(id, messageId) {
+    if (messageId !== undefined) {
+      return this.db.prepare("SELECT id, content FROM messages WHERE ticket_id = ? AND role = 'assistant' AND id = ?")
+        .get(id, messageId);
+    }
+    return this.db.prepare("SELECT id, content FROM messages WHERE ticket_id = ? AND role = 'assistant' ORDER BY id DESC LIMIT 1")
+      .get(id);
+  }
+
+  verboseEnabled(chatKey) {
+    return this.db.prepare('SELECT verbose FROM chat_settings WHERE chat_key = ?').get(chatKey)?.verbose === 1;
+  }
+
+  setVerbose(chatKey, enabled) {
+    this.db.prepare(`INSERT INTO chat_settings (chat_key, verbose) VALUES (?, ?)
+      ON CONFLICT(chat_key) DO UPDATE SET verbose = excluded.verbose`).run(chatKey, enabled ? 1 : 0);
+  }
+
+  saveTrace(jobId, trace) {
+    this.db.prepare(`INSERT INTO job_traces (job_id, entries, dropped) VALUES (?, ?, ?)
+      ON CONFLICT(job_id) DO UPDATE SET entries = excluded.entries, dropped = excluded.dropped`)
+      .run(jobId, JSON.stringify(trace.entries), trace.dropped);
+  }
+
+  latestTrace(ticketId) {
+    const row = this.db.prepare(`SELECT t.entries, t.dropped FROM jobs j
+      LEFT JOIN job_traces t ON t.job_id = j.id WHERE j.ticket_id = ?
+      AND (j.state NOT IN ('queued', 'paused', 'cancelled') OR t.job_id IS NOT NULL)
+      ORDER BY CASE WHEN j.state = 'running' THEN 0 ELSE 1 END, j.id DESC LIMIT 1`).get(ticketId);
+    return row?.entries ? { entries: JSON.parse(row.entries), dropped: row.dropped } : null;
   }
 
   enqueue(id, content, images = []) {

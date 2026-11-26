@@ -1,6 +1,7 @@
 import { EventEmitter } from 'node:events';
 import { randomUUID } from 'node:crypto';
 import WebSocket from 'ws';
+import { fileBytes } from './files.js';
 import { imageBytes } from './images.js';
 import { splitMarkdown } from './schedule-delivery.js';
 
@@ -147,6 +148,34 @@ export class OneBotClient extends EventEmitter {
       });
       if (sent?.message_id == null) throw new Error('OneBot 未返回图片消息 ID，无法确认送达');
       return sent.message_id;
+    });
+    this.sendQueue = task.catch(() => {});
+    return task;
+  }
+
+  sendFile(target, file, { signal } = {}) {
+    const match = /^(user|group):([1-9]\d*)$/.exec(target);
+    if (!match) return Promise.reject(new Error('无效的 QQ 文件目标'));
+    const task = this.sendQueue.then(async () => {
+      fileBytes(file);
+      signal?.throwIfAborted();
+      if (!this.ready || this.stopped) throw new Error('QQ 长连接离线');
+      const delay = this.sendIntervalMs - (Date.now() - this.lastSent);
+      if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
+      signal?.throwIfAborted();
+      if (!this.ready || this.stopped) throw new Error('QQ 长连接离线');
+      const group = match[1] === 'group';
+      this.lastSent = Date.now();
+      try {
+        await this.call(group ? 'upload_group_file' : 'upload_private_file', {
+          [group ? 'group_id' : 'user_id']: match[2], name: file.name, file: `base64://${file.data}`,
+        });
+      } catch (error) {
+        throw new Error(`OneBot 文件上传未确认成功：${error.message}。需要支持 upload_private_file / upload_group_file 及 base64 文件的实现（如相应版本的 NapCat）。`);
+      }
+      // These extension APIs may return data:null on success; acknowledge only
+      // API acceptance, not recipient delivery or a fabricated message ID.
+      return { status: 'accepted' };
     });
     this.sendQueue = task.catch(() => {});
     return task;

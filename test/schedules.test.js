@@ -37,6 +37,7 @@ function harness(t, options = {}) {
     sendChat: options.sendChat ?? (async (target, text) => sent.push({ target, text })),
     isChatReady: options.isChatReady,
     sendImage: options.sendImage,
+    sendFile: options.sendFile,
     webhookSender: options.webhookSender ?? (async (target, text) => sent.push({ target, text })),
     createSession: (args) => {
       const cancelled = deferred();
@@ -446,4 +447,21 @@ test('定时发图固定到任务 QQ 目标，Webhook 任务不暴露 QQ 发图�
   assert.equal(images[0].target, 'qqbot:12345:group:G');
   assert.equal(h.sessions[1].onImage, undefined);
   await assert.rejects(h.sessions[0].onImage({}), /结束|停止/);
+});
+
+
+test('定时文件回传绑定任务聊天，Webhook 不挂载文件工具，结束后拒绝发送', async (t) => {
+  const files = [];
+  const h = harness(t, { sendFile: async (target, file) => { files.push({ target, file }); return { status: 'accepted' }; },
+    run: async (_prompt, session) => {
+      if (session.onFile) assert.deepEqual(await session.onFile({ name: 'report.pdf' }), { status: 'accepted' });
+      return '完成';
+    } });
+  h.add({ target: 'qqbot:12345:group:G', chatTarget: 'qqbot:12345:group:G' });
+  h.add({ targetType: 'webhook', target: webhook });
+  await h.command('run 1'); await h.command('run 2'); await flush();
+  assert.equal(files.length, 1);
+  assert.equal(files[0].target, 'qqbot:12345:group:G');
+  assert.equal(h.sessions[1].onFile, undefined);
+  await assert.rejects(h.sessions[0].onFile({}), /结束|停止/);
 });

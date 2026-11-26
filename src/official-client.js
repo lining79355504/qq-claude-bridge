@@ -1,6 +1,7 @@
 import { EventEmitter } from 'node:events';
 import WebSocket from 'ws';
 import { OfficialApi } from './official-api.js';
+import { fileBytes } from './files.js';
 import { imageBytes } from './images.js';
 import { splitMarkdown } from './schedule-delivery.js';
 
@@ -150,7 +151,7 @@ export class OfficialClient extends EventEmitter {
     const reply = this.replies.get(target);
     const passive = reply && reply.createdAt + this.replyWindowMs > this.now() && reply.seq < this.maxReplies;
     if (!passive && !this.allowProactive) {
-      throw new Error('QQ 被动回复窗口或条数已用尽。请在原聊天发 /history 或 /status 获取结果；主动推送需要平台权限并开启 QQBOT_ALLOW_PROACTIVE。');
+      throw new Error('QQ 被动回复窗口或条数已用尽。请在原聊天发 /result 工单编号 分页获取已保存回复，或 /status 查看状态。主动推送需要平台权限，QQBOT_ALLOW_PROACTIVE 开关本身不能授予权限。');
     }
     return passive ? { msg_id: reply.id, msg_seq: reserve ? ++reply.seq : reply.seq + 1 } : {};
   }
@@ -188,6 +189,35 @@ export class OfficialClient extends EventEmitter {
       const sent = await this.api.request(`${path}/messages`, { body, signal: combined });
       if (!sent?.id) throw new Error('QQ API 未返回图片消息 ID，无法确认送达');
       return sent.id;
+    });
+  }
+
+  sendFile(target, file, { signal } = {}) {
+    return this.enqueueSend(async () => {
+      fileBytes(file);
+      const { type, id } = this.targetOf(target);
+      await this.waitToSend(signal);
+      this.replyFields(target, false);
+      const combined = signal ? AbortSignal.any([signal, this.controller.signal]) : this.controller.signal;
+      const path = `/v2/${type}/${encodeURIComponent(id)}`;
+      let uploaded;
+      try {
+        // Type 4 is the general-file category. Platform availability is NOT
+        // guaranteed; do not disguise documents as images or publish a URL.
+        uploaded = await this.api.request(`${path}/files`, { signal: combined,
+          body: { file_type: 4, file_data: file.data, file_name: file.name, srv_send_msg: false } });
+      } catch (error) {
+        throw new Error(`QQ 普通文件上传失败：${error.message}。当前应用或平台可能不支持通用文件；未发送文件消息。可改用支持文件上传的 NapCat / OneBot 通道。`);
+      }
+      if (typeof uploaded?.file_info !== 'string' || !uploaded.file_info) {
+        throw new Error('QQ 普通文件上传未返回 file_info，未发送文件消息；此应用可能不支持普通文件上传');
+      }
+      await this.waitToSend(signal);
+      const body = { msg_type: 7, media: { file_info: uploaded.file_info }, ...this.replyFields(target) };
+      this.lastSent = this.now();
+      const sent = await this.api.request(`${path}/messages`, { body, signal: combined });
+      if (!sent?.id) throw new Error('QQ API 未返回文件消息 ID，无法确认送达');
+      return { status: 'sent', messageId: sent.id };
     });
   }
 

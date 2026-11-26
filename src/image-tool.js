@@ -1,5 +1,6 @@
 import { createSdkMcpServer, tool } from '@anthropic-ai/claude-agent-sdk';
 import { z } from 'zod';
+import { fileTool } from './file-tool.js';
 import { readWorkspaceImage } from './images.js';
 
 export const IMAGE_TOOL_NAME = 'mcp__qq__send_image';
@@ -26,6 +27,6 @@ export function imageTool({ workspace, getAllowedPaths, getDeniedTools, onImage,
 
 export function imageServer(options) {
   return createSdkMcpServer({ name: 'qq', version: '1.0.0', alwaysLoad: true,
-    instructions: '当前 QQ 通道支持图片附件。用户要求截图或图片时，调用 send_image 回传已生成的本地图片；不要把保存文件当作已经发图。',
-    tools: [imageTool(options)] });
+    instructions: '图片用 send_image，普通文件用 send_file 回传当前聊天。文件是否发送成功以工具回执为准，平台拒绝时报告具体错误。保存本地路径不代表已发送。',
+    tools: [...(options.onImage ? [imageTool(options)] : []), ...(options.onFile ? [fileTool(options)] : [])] });
 }

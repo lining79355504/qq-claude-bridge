@@ -265,6 +265,57 @@ test('官方消息 → 工单 → 模拟 Claude → 官方回复；结果持久�
   assert.ok(sends.at(-1).body.content.includes('检查完成'));
 });
 
+test('过期或条数耗尽后结果仍可用新消息分页取回，模型只执行一次', async (t) => {
+  for (const reason of ['expired', 'exhausted']) {
+    const h = await clientHarness(t, { maxReplies: reason === 'exhausted' ? 1 : 5 });
+    const store = new TicketStore(':memory:');
+    t.after(() => store.close());
+    const logs = [];
+    let runs = 0;
+    const answer = '完整测试结果🧪\n'.repeat(500);
+    const logger = { warn() {}, error: (...args) => logs.push(args.join(' ')) };
+    const send = (frame, text) => h.client.sendMessage(frame.target, text);
+    const bot = new TicketBot({ store, config: { ...policy, transport: 'official', messageMaxBytes: 3800,
+      workspace: process.cwd(), allowedPaths: [process.cwd()], permissionMode: 'auto', readOnlyTools: [] },
+    logger, send,
+    createProgress: (frame, ticket) => new QQProgress({ ticketId: ticket.id, send: (text) => send(frame, text), logger }),
+    createSession: () => ({ isBusy: () => false, abort() {}, lastRunSucceeded: true, run: async () => {
+      runs++;
+      if (reason === 'expired') h.advance(240001);
+      return answer;
+    } }),
+    });
+    const message = normalizeOfficialMessage(event(), policy, { now: 100000 });
+    h.client.rememberReply(message.frame);
+    await bot.handle(message);
+    await bot.drainPromise;
+    assert.equal(store.get(1).status, 'review');
+    assert.equal(store.result(1).content, answer);
+    assert.ok(logs.some((text) => text.includes('/result 1')));
+    assert.equal(h.http.calls.filter((call) => call.url.includes('/messages')).length, 1);
+    let command = '/result 1';
+    let page = 0;
+    while (command) {
+      const time = reason === 'expired' ? 340001 : 100000;
+      const query = normalizeOfficialMessage(event({ id: `result-${++page}`, content: command,
+        timestamp: new Date(time).toISOString() }), policy, { now: time });
+      h.client.rememberReply(query.frame);
+      const before = h.http.calls.length;
+      await bot.handle(query);
+      assert.equal(h.http.calls.length, before + 1);
+      const body = h.http.calls.at(-1).body;
+      assert.equal(body.msg_id, `result-${page}`);
+      assert.equal(body.msg_seq, 1);
+      assert.ok(Buffer.byteLength(body.content) <= 3800);
+      command = /下一页：(.*)$/.exec(body.content)?.[1];
+      assert.ok(page < 20);
+    }
+    assert.ok(page > 1);
+    assert.equal(runs, 1);
+    assert.equal(h.client.allowProactive, false);
+  }
+});
+
 
 test('官方图片上传后发送富媒体消息，私聊/群聊共用文本回复序号与队列', async (t) => {
   const h = await clientHarness(t);
@@ -304,4 +355,39 @@ test('图片回复过期不上传；上传失败、缺回执、取消均失败�
   h.api.request = async (path) => { calls.push(path); midUpload.abort(); return { file_info: 'file-info' }; };
   await assert.rejects(h.client.sendImage(target, image, { signal: midUpload.signal }));
   assert.equal(calls.length, 4);
+});
+
+
+test('官方普通文件尝试 type=4，保留文件名，两阶段回执成功后才确认发送', async (t) => {
+  const h = await clientHarness(t);
+  const file = { name: '报告.pdf', data: Buffer.from('%PDF-test').toString('base64') };
+  for (const type of ['user', 'group']) {
+    const target = `qqbot:12345:${type}:DEST`;
+    h.client.rememberReply({ target, reply: { id: `incoming-${type}`, createdAt: 100000 } });
+    await h.client.sendMessage(target, '准备发送');
+    assert.equal((await h.client.sendFile(target, file)).status, 'sent');
+    const [upload, send] = h.http.calls.slice(-2);
+    assert.equal(upload.url, `https://api.sgroup.qq.com/v2/${type === 'user' ? 'users' : 'groups'}/DEST/files`);
+    assert.deepEqual(upload.body, { file_type: 4, file_name: '报告.pdf', file_data: file.data, srv_send_msg: false });
+    assert.deepEqual(send.body, { msg_type: 7, media: { file_info: 'uploaded-image-info' }, msg_id: `incoming-${type}`, msg_seq: 2 });
+  }
+});
+
+test('官方普通文件被平台拒绝时不发送消息、不重试、不绕过；窗口过期/取消不上传', async (t) => {
+  const h = await clientHarness(t);
+  const target = 'qqbot:12345:user:DEST';
+  const file = { name: 'a.zip', data: Buffer.from('ZIP').toString('base64') };
+  const calls = [];
+  h.api.request = async (path) => { calls.push(path); throw new Error('QQ API HTTP 400，code=123'); };
+  await assert.rejects(h.client.sendFile(target, file), /窗口/);
+  assert.equal(calls.length, 0);
+  h.client.rememberReply({ target, reply: { id: 'm1', createdAt: 100000 } });
+  await assert.rejects(h.client.sendFile(target, file), /可能不支持通用文件/);
+  assert.deepEqual(calls, ['/v2/users/DEST/files']);
+  await assert.rejects(h.client.sendFile(target, file, { signal: AbortSignal.abort() }));
+  assert.equal(calls.length, 1);
+  h.api.request = async () => ({});
+  await assert.rejects(h.client.sendFile(target, file), /file_info/);
+  h.api.request = async (path) => path.endsWith('/files') ? { file_info: 'file-info' } : {};
+  await assert.rejects(h.client.sendFile(target, file), /无法确认送达/);
 });

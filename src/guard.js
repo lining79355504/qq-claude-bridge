@@ -23,6 +23,7 @@ function extractPaths(toolName, input) {
   };
 
   switch (toolName) {
+    case 'mcp__qq__send_file':
     case 'mcp__qq__send_image':
     case 'Read':
     case 'Write':
